@@ -1,15 +1,18 @@
 Robotics-IRobot
 
-The README is used to introduce the module and provide instructions on
-how to install the module, any machine dependencies it may have (for
-example C compilers and installed libraries) and any other information
-that should be provided before the module is installed.
+Robotics::IRobot provides an interface for controlling and accessing
+sensor data from iRobot robots that support the OI Interface.
 
-A README file is required for CPAN modules since CPAN extracts the README
-file from a module distribution so that people browsing the archive
-can use it to get an idea of the module's uses. It is usually a good idea
-to provide version information here so that people can decide whether
-fixes for the module are worth downloading.
+This module provides on object oriented interface to the robot and allows
+for both event-driven and polling-based reading of sensor data. It provides
+all functionality defined in the OI Interface for Roomba 400 series and
+Create robots. Also provided is some additional functionality such as
+primative dead reckoning and enhanced use of the Create's song
+functionality.
+
+Currently this module will only run on linux systems.  This is
+because of a requirement on Device::SerialPort.  In the future,
+it may support windows systems via Win32::SerialPort.
 
 
 INSTALLATION

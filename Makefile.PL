@@ -13,6 +13,10 @@ WriteMakefile(
     PL_FILES            => {},
     PREREQ_PM => {
         'Test::More' => 0,
+	'Time::HiRes' => 0,
+	'Device::SerialPort' => 0,
+	'POSIX' => 0,
+	'Math::Trig' => 0
     },
     dist                => { COMPRESS => 'gzip -9f', SUFFIX => 'gz', },
     clean               => { FILES => 'Robotics-IRobot-*' },
