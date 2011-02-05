@@ -39,11 +39,11 @@ Robotics::IRobot - provides interface to iRobot Roomba and Create robots
 
 =head1 VERSION
 
-Version 0.11
+Version 0.12
 
 =cut
 
-our $VERSION='0.11';
+our $VERSION='0.12';
 
 =head1 REFERENCES
 
@@ -51,7 +51,7 @@ IRobot Open Interface specification -- L<http://www.irobot.com/filelibrary/pdfs/
 
 =head1 REQUIRES
 
-Time::HiRes, Device::SerialPort, POSIX, Math::Trig
+Time::HiRes, Device::SerialPort, YAML::Tiny, POSIX, Math::Trig
 
 =head1 EXPORTS
 
@@ -92,6 +92,7 @@ use strict;
 use Time::HiRes qw(usleep ualarm time sleep);
 use Device::SerialPort;
 use POSIX qw(fmod);
+use YAML::Tiny;
 use Math::Trig;
 use Math::Trig ':pi';
 use Math::Trig ':radial';
@@ -99,9 +100,12 @@ use Math::Trig ':radial';
 my $DEBUG=0;
 my $EPSILON=0.015;
 my $WHEEL_WIDTH=258;
+my $ROBOT_WIDTH=330;
 
 #Class Data (defined at end of file)
-my ($sensorSpecs,$sensorGroups,@sensorFields,@slipFactors,@keys, $notes, $keys, @sharps);
+my ($sensorSpecs,$sensorGroups,@sensorFields,
+	$calibrationDefaults, $notes, $keys, @sharps,
+	$sensorLocations, @cliffSensors);
 
 ########initialization Commands################
 =head1 METHODS
@@ -110,26 +114,30 @@ my ($sensorSpecs,$sensorGroups,@sensorFields,@slipFactors,@keys, $notes, $keys, 
 
 =over 4
 
-=item Robotics::IRobot->new($port)
+=item Robotics::IRobot->new($port,$indirectSensorsOn)
 
-Creates a new IRobot object using the given communications port.
+Creates a new IRobot object using the given communications port (defaults to /dev/iRobot)
+and enables indirect sensors if $indirectSensorsOn is true (this is the default).
 
 =cut
 
 sub new {
 	shift;
 	my $self={
-		portFile=>(shift || '/dev/iRobot'), deadReckoningOn=>(shift || 1),
-		readBuffer=> '', sensorState=>{}, ledState=>{}, pwmState=>[0,0,0],
-		outputState=>[0,0,0],
+		portFile=>(shift || '/dev/iRobot'), indirectSensorsOn=>(shift || 1),
+		deadReckoning=>\&_correctiveDeadReckoning,
+		readBuffer=> '', sensorState=>{lastSensorRefresh=>time()}, ledState=>{},
+		pwmState=>[0,0,0], outputState=>[0,0,0],
 		sensorListeners=>[], safetyChecks=>1, scriptMode=>0,
-		nextListenerId=>0, lastSensorRefresh=>time(), initialCliff=>[]
+		timeEvents=>[],
+		nextListenerId=>0, lastCliff=>{}, gatherCliffStatistics=>0,
+		calibration=>$calibrationDefaults
 		};
 	bless($self);
 	
 	$self->markOrigin();
 
-	$self->{deadReckoningId}=$self->addSensorListener(0,\&deadReckoning) if ($self->{deadReckoningOn});
+	$self->{indirectSensorsId}=$self->addSensorListener(0,\&_indirectSensors) if ($self->{indirectSensorsOn});
 	
 	$self->loadCalibrationData();
 	
@@ -147,13 +155,13 @@ Initializes the port, connects to the robot, and initiates the OI Interface.
 sub init {
 	my $self=shift;
 	
-	$self->_initPort();
+	$self->initPort();
 	sleep 1;
 	
 	$self->writeBytes(128);
 	my ($bytes,$startupMsg)=$self->{port}->read(255);
 	
-	$self->writeTelem('R',$startupMsg);
+	$self->_writeTelem('R',$startupMsg);
 	
 	return $startupMsg;
 }
@@ -177,36 +185,18 @@ sub initForReplay($$) {
         open $replay, $file;
         $self->{replay}=$replay;
         
-        my ($time,$type,$data)=$self->readTelem();
+        my ($time,$type,$data)=$self->_readTelem();
         
         die "Invalid replay file!" unless ($type eq 'B');
         
         $self->{replayDelta}=time-$time;
         
         while($type ne 'R') {
-                ($time,$type,$data)=$self->readTelem();
+                ($time,$type,$data)=$self->_readTelem();
         }
         
 }
 
-
-sub loadCalibrationData($) {
-	my $self=shift;
-	
-	
-	if (open CALIB,"calibration.txt") {
-		my $calib='';
-		while(<CALIB>) {
-			$calib.=$_;
-		}
-		
-		close CALIB;
-		
-		@slipFactors=split(/\s*,\s*/,$calib);
-		
-	}
-	
-}
 ######Actuator Commands########
 
 =head2 Actuators
@@ -228,7 +218,7 @@ sub reset($) {
 	$self->close();
 	sleep 5;
 	
-	$self->_initPort();
+	$self->initPort();
 	sleep 1;
 	return $self->init();
 }
@@ -626,7 +616,7 @@ sub updateDigitalOutputs($) {
 =item $robot->setPWMLoads($lsd0, $lsd1, $lsd2)
 
 Sets pwm duty cycle on low side drivers.  Load values should be between 0 and 1 inclusive.  
-	
+
 	0 is off, 1 is on, .5 is pulsed on 50% of the time, etc.
 
 =cut
@@ -750,7 +740,7 @@ sub sendIR($$) {
 
 Sets song $songId in robot's memory to @songBytes.  
 @songBytes can contain up to 16 notes.
-	
+
 See Open Interface doc for details.
 
 =cut
@@ -798,7 +788,7 @@ sub playLongSongRaw($$@) {
  
 	my @song=@_;
 	
-	print "playing: " . join(", ",@song) . "\n";
+	#print "playing: " . join(", ",@song) . "\n";
 	
 	$self->setSongRaw(15,splice(@song,0,32));
 	
@@ -838,7 +828,7 @@ sub playLongSongRaw($$@) {
 }
 
 =item IRobot::loadABCNotation($file)
-	
+
 Loads song in ABCNotation format from $file (see abcnotation.com).
 Returns song in format defined in OI Interface.  If smaller than 16 notes (32 bytes)
 can be passed to setSongRaw.  Otherwise resulting bytes can be passed to playLongSongRaw.
@@ -1016,7 +1006,7 @@ sub playSong($$) {
 	my $self=shift;
 	my $songId=shift;
 	
-	print "playing song: $songId\n";
+	#print "playing song: $songId\n";
 	
 	$self->writeBytes(141,$songId);
 }
@@ -1040,30 +1030,18 @@ sub turnTo($$$) {
 	my $angle=shift;
 	my $speed=shift;
 	my $callback=shift;
-	my $stage=shift || 2;
 	
 	$angle=_normalizeAngle($angle);
 	my $direction=$self->{sensorState}{direction};
 	my $delta=_normalizeAngle($angle-$direction);
 
-	print join(", ",$angle,$delta,$speed,$stage) . "\n";
+	#print join(", ",$angle,$delta,$speed) . "\n";
 	
-	if ($stage==2) {
-		$self->waitAngle(200,($delta*.95),
-			sub {
-				$self->turnTo($angle,100,
-					sub {
-						$self->stop();
-						&$callback($self,$delta) if ($callback);
-					},
-					$stage-1
-				);
-			}
-		);
-	} else {
-		$self->waitTillFacing(200,$direction,deg2rad(1),$callback);
-	}	
-	$self->rotateLeft(($delta<=>0)*$speed*($stage==1?-1:1));
+	$self->waitAngle(200,$delta-8*$EPSILON*$speed/$WHEEL_WIDTH, sub {
+		$self->stop();
+		&$callback($self,$delta) if ($callback);
+	});
+	$self->rotateLeft(($delta<=>0)*$speed);
 	
 }
 
@@ -1156,7 +1134,7 @@ Returns an array indicating the presense of a "home base" docking station and an
 Example:
 
 	my ($dockPresent,$greenBeacon,$forceField,$redBeacon)=$robot->getDockSignal();
-	
+
 =cut
 
 sub getDockSignal($) {
@@ -1179,31 +1157,86 @@ sub getDockSignal($) {
 }
 
 
+=item $robot->getSensorLocation($sensor)
+
+Gets the current location of a sensor on the create.  Possible sensors:
+
+=over 4
+
+=item cliffLeft
+
+=item cliffFrontLeft
+
+=item cliffFrontRight
+
+=item cliffRight
+
+=item bumpLeft
+
+=item bumpCenter
+
+=item bumpRight
+
+=item caster
+
+=item irSensor
+
+=item wheelLeft
+
+=item wheelRight
+
+=item
+
+=back
+
+=cut	
+
+sub getSensorLocation($$) {
+	my $self=shift;
+	my $sensor=shift;
+	
+	my $sensorState=$self->{sensorState};
+	my ($x,$y);
+
+	if (defined($sensorLocations->{$sensor})) {
+		my $sensorLocation=$sensorLocations->{$sensor};
+		($x,$y)=cylindrical_to_cartesian($sensorLocation->[0],$sensorLocation->[1]+$self->{sensorState}{direction});
+	} else {
+		($x,$y)=0;
+	}
+	
+	return ($sensorState->{x}+$x,$sensorState->{y}+$y);
+}
+
 =item $robot->refreshSensors()
 
 Retrieves all sensor data, refreshes sensor state hash, and triggers any sensor listeners or events.  This method will
 block for up to 15ms if called more than once every 15ms.
+
+If you are not calling this method more than once every few seconds.  You may wish to switch the movement correction
+mode to 'robot' or 'raw', as these may be more accurate in this situation.  See setMovementCorrectionMode method.
 
 =cut
 
 sub refreshSensors($) {
 	my $self=shift;
 	
-	my $sinceLastRefresh=(time()-$self->{lastSensorRefresh});
+	my $sinceLastRefresh=(time()-$self->{sensorState}{lastSensorRefresh});
 	
 	sleep($EPSILON - $sinceLastRefresh) if ($sinceLastRefresh < $EPSILON);
 	
 	$self->getSensor(6);
-	
-	my $now=time();
-	$self->{deltaT}=$now-$self->{lastSensorRefresh};
-	$self->{lastSensorRefresh}=$now;
 }
 
 =item $robot->getSensor($sensorId)
 
 Retreives data from a single sensor, refreshes sensor state hash, and triggers any sensor listeners or events.
 This method is generally not recommedended.  $robot->refreshSensors() should be used instead.
+
+If you are not polling the distance and angle sensors more than once every few seconds.  You may wish to switch the dead reckoning
+mode to 'robot' or 'raw', as these may be more accurate in this situation.  See setMovementCorrectionMode method.
+
+See OI Documentation for sensor ids.
 
 =cut
 
@@ -1214,6 +1247,8 @@ sub getSensor($$) {
 	$self->writeBytes(142,$sensorId);
 	my @data=$self->_readSensorData($sensorId);
 	
+	$self->_triggerSensorEvents([$sensorId]);
+	
 	return wantarray ? @data : $data[0];
 }
 
@@ -1221,6 +1256,9 @@ sub getSensor($$) {
 
 Retrieves data for a particular sensor, refreshes sensor state hash, and triggers any sensor listeners or events.  This method is
 generally not recommended.  $robot->refreshSensors() should be used instead.
+
+If you are not polling the distance and angle sensors more than once every few seconds.  You may wish to switch the dead reckoning
+mode to 'robot' or 'raw', as these may be more accurate in this situation.  See setMovementCorrectionMode method.
 
 See OI Documentation for sensor ids.
 
@@ -1237,6 +1275,8 @@ sub getSensors($@) {
 	foreach $sensorId (@_) {
 		push @retArr,$self->_readSensorData($sensorId);
 	}
+	
+	$self->_triggerSensorEvents(\@_);
 	
 	return @retArr;
 }
@@ -1275,6 +1315,7 @@ sub exitSensorLoop($) {
 }
 
 =item $robot->startStream()
+
 =item $robot->startStream($sensorId)
 
 Puts robot into streaming mode.  If a $sensorId is passed only streams that sensor.  Otherwises streams data from
@@ -1290,6 +1331,7 @@ sub startStream($@) {
 	push @_,6 unless (@_ > 0);
 	
 	$self->writeBytes(148,(@_+0),@_);
+	$self->{isStreaming}=1;
 	
 	$self->_syncStream();
 }
@@ -1304,6 +1346,7 @@ sub pauseStream($) {
 	my $self=shift;
 	
 	$self->writeBytes(150,0);
+	$self->{isStreaming}=0;
 }
 
 =item $robot->resumeStream()
@@ -1316,6 +1359,7 @@ sub resumeStream($) {
 	my $self=shift;
 	
 	$self->writeBytes(150,1);
+	$self->{isStreaming}=1;
 }
 
 =item $robot->getStreamFrame()
@@ -1333,41 +1377,42 @@ sub getStreamFrame($) {
 		
 	my (@data,$readBytes);
 	
-	while ($data[0]!=19) {
-		$readBytes=$self->readData(2);
-		@data=unpack('CC',$readBytes);
-	
-	
-		print "Read bytes: " . join(", ",@data) . "\n" if ($DEBUG);
-		if ($data[0]!=19) {
-			print "Stream lost.  Attempting to re-sync.\n";
-			$self->_syncStream();
+	if ($self->{isStreaming}) {
+		while ($data[0]!=19) {
+			$readBytes=$self->readData(2);
+			@data=unpack('CC',$readBytes);
+		
+		
+			print "Read bytes: " . join(", ",@data) . "\n" if ($DEBUG);
+			if ($data[0]!=19) {
+				print "Stream lost.  Attempting to re-sync.\n";
+				$self->_syncStream();
+			}
 		}
+		
+		my $packetLength=$data[1];
+		
+		$readBytes=$self->readData($packetLength+1);
+		print "Read bytes: " . join(", ",unpack('C*',$readBytes)) . "\n" if ($DEBUG);
+		
+		my $i=0;
+		my @sensorIds;
+		while($i<$packetLength) {
+			my $sensorId=unpack('C',substr($readBytes,$i,1));
+			$i++;
+			
+			my ($readLength, $packString)=@{$sensorSpecs->[$sensorId]};
+			
+			my @data=unpack($packString,substr($readBytes,$i,$readLength));
+			_updateSensorState($sensorId,$self->{sensorState},$self->{slipFactor},@data);
+			
+			push @sensorIds,$sensorId;
+			
+			$i+=$readLength;
+		}
+		$self->_triggerSensorEvents(\@sensorIds);
+		
 	}
-	
-	my $packetLength=$data[1];
-	
-	$readBytes=$self->readData($packetLength+1);
-	print "Read bytes: " . join(", ",unpack('C*',$readBytes)) . "\n" if ($DEBUG);
-	
-	my $i=0;
-	my @sensorIds;
-	while($i<$packetLength) {
-		my $sensorId=unpack('C',substr($readBytes,$i,1));
-		$i++;
-		
-		my ($readLength, $packString)=@{$sensorSpecs->[$sensorId]};
-		
-		my @data=unpack($packString,substr($readBytes,$i,$readLength));
-		_updateSensorState($sensorId,$self->{sensorState},$self->{slipFactor},@data);
-		$self->_triggerSensorEvents($sensorId);
-		
-		$i+=$readLength;
-	}
-	
-	my $now=time();
-	$self->{deltaT}=$now-$self->{lastSensorRefresh};
-	$self->{lastSensorRefresh}=$now;
 	
 }
 
@@ -1381,14 +1426,25 @@ The priority parameter is used to determine the order in which listeners are cal
 Any listeners with a negative priority will be called before indirect sensors (dead reckoning) is calculated.  Listeners with
 a priority less than 200 will be called before triggers for waitDistance, waitAngle, etc. events are called.
 
-On each sensor data retrieval &$action($robot,$listener,$sensorId) will be called.  $listener is a hash containing the
-following keys
+On each sensor data retrieval &$action($robot,$listener,$sensorIds) will be called.  $sensorIds is a array ref containing the read sensorIds. 
+$listener is a hash containing the following keys:
 
-	id: listener id -- used to remove listener
-	priority: listener priority -- do not changed this value
-	action: the function being called
-	param: the value of $param passed to addSensorListener
-	
+=over 5
+
+=item id:
+listener id -- used to remove listener
+
+=item priority:
+listener priority -- do not changed this value
+
+=item action:
+the function being called
+
+=item param:
+the value of $param passed to addSensorListener
+
+=back
+
 The same hash ref is returned with each call, so this can be used by the action callback to store values.  $action must return
 true for processing of additional listeners to continue.  This is useful for saftey checks, if you do not want any additional processing
 which could restart a stopped robot have $action return false.
@@ -1412,7 +1468,7 @@ sub addSensorListener($$$$) {
 	
 	my $added=0;
 	for(my $i=0;!$added && $i<@{$sensorListeners};$i++) {
-		if (($sensorListeners->[$i]{priority}) < $priority) {
+		if (($sensorListeners->[$i]{priority}) > $priority) {
 			splice(@{$sensorListeners},$i,0,$newSensorListener);
 			$added=1;
 		}
@@ -1444,8 +1500,8 @@ sub removeSensorListener($$) {
 
 =item $robot->addSensorEvent($priority,$test,$action,$param,$oneTime)
 
-Executes &$test($robot,$listener,$sensorId) each time sensor data is retrieved.  $listener
-is a hash reference (see addSensorListener).  $sensorId is the id of the sensor read.  &$action($robot,$listener,$sensorId)
+Executes &$test($robot,$listener,$sensorIds) each time sensor data is retrieved.  $listener
+is a hash reference (see addSensorListener).  $sensorIds is the array ref containing ids of the sensors read.  &$action($robot,$listener,$sensorIds)
 is called if $test returns true. $param is included in the $listener hash ref.  If $oneTime is true, the created listener is
 automatically removed the first time $test returns true.
 
@@ -1622,8 +1678,6 @@ sub waitTime($$$) {
 
 Sets the robot's current position as (0,0) and the direction the robot is currently facing as 0.
 
-=back
-
 =cut
 
 sub markOrigin($) {
@@ -1634,14 +1688,30 @@ sub markOrigin($) {
 	$self->{sensorState}{direction}=0;
 }
 
+=item $robot->setPosition($x,$y,$direction)
+
+Sets the robots current position as ($x,$y) and the direction $direction (in radians).  0 is along the +y axis.
+
+=back
+
+=cut
+
+sub setPosition($$$$) {
+	my $self=shift;
+	
+	$self->{sensorState}{x}=shift;
+	$self->{sensorState}{y}=shift;
+	$self->{sensorState}{direction}=shift;
+	
+}
 
 sub _triggerSensorEvents($$) {
 	my $self=shift;
-	my $sensorId=shift;
+	my $sensorIds=shift;
 
 	my $sensorListener;
 	foreach $sensorListener (@{$self->{sensorListeners}}) {
-		last unless (&{$sensorListener->{action}}($self,$sensorListener,$sensorId));
+		last unless (&{$sensorListener->{action}}($self,$sensorListener,$sensorIds));
 	}
 	
 }
@@ -1659,7 +1729,6 @@ sub _readSensorData($$) {
 	my @data=unpack($packString,$readBytes);
 	
 	_updateSensorState($sensorId,$self->{sensorState},$self->{slipFactor},@data);
-	$self->_triggerSensorEvents($sensorId);
 	
 	return @data;
 }
@@ -1724,6 +1793,8 @@ sub getSensorString($) {
 	my $sensorState=$self->{sensorState};
 	my $c=0;
 	my $output='';
+	my @keys=sort keys %{$self->{sensorState}};
+	
 	foreach my $key (@keys) {
 		$output .= $key . ": " . ($key eq 'direction'?rad2deg($sensorState->{$key}):$sensorState->{$key}) . ((($c % 4)==3) ? "\r\n" : "\t");
 		$c++;
@@ -1758,7 +1829,7 @@ The battery line shows the battery charge and maxium capacity, the current and v
 the battry temperature, the charging state.  Also, the byte recieved by the IR sensor is shown on this line.   In the example above,
 the battery has charge of 2606 mAh out of a maximum capacity of 2702 mAh.  The battery is charging at 1087 mA and 17200 mV.
 Positive current values indicate charging, negative ones indicate discharge.  The battery temperature is 32 degrees C.  The C indicates
-the battery is charging.  And the IR byte receiving byte 254.
+the battery is charging.  The IR sensor is receiving byte 254.
 
 The fourth line shows the estimated x and y position in mm, and the current direction in degrees.  Also shown is any docking
 indicators: dock present (D), green beacon (G), force field (F), red beacon (R).
@@ -2051,10 +2122,10 @@ sub logTelemetry($$$) {
 	my $type=shift;
 	my $data=shift || '';
 
-	$self->writeTelem('M',chr($type) . $data);
+	$self->_writeTelem('M',chr($type) . $data);
 }
 
-sub readTelem($) {
+sub _readTelem($) {
 	my $self=shift;
  
 	my ($bytes,$data,$time,$type,$length,$tdata,$timeLow,$timeHigh);
@@ -2084,7 +2155,7 @@ sub readTelem($) {
 	return ($time/1000,$type,$data);
 }
 
-sub writeTelem($$$) {
+sub _writeTelem($$$) {
 	my $self=shift;
 	my $type=shift;
 	my $data=shift;
@@ -2094,6 +2165,228 @@ sub writeTelem($$$) {
 	my $timeHigh=$time >> 32;
 	
 	print {$self->{telem}} pack("LLACa*",$timeLow,$timeHigh,$type,length($data),$data) if ($self->{telem});
+}
+
+=head2 Sensor Calibration
+
+=over 4
+
+=item $robot->loadCalibrationData($file)
+
+Loads saved calibration file from $file or calibration.yaml if no file is given.  This is called automatically on initialization.  So, it is only
+necessary if you wish to load calibration data from another file.
+
+=cut
+
+sub loadCalibrationData($$) {
+	my $self=shift;
+	my $file=shift || 'calibration.yaml';
+	
+	my $calibData=YAML::Tiny->read($file);
+	
+	$self->{calibration}=$calibData->[0] if ($calibData);
+}
+
+=item $robot->saveCalibrationData($file)
+
+Saves calibration data to $file or calibration.yaml if no file is given.
+
+=cut
+
+sub saveCalibrationData($$) {
+	my $self=shift;
+	my $file=shift || 'calibration.yaml';
+	
+	my $calibData=YAML::Tiny->new;
+	
+	$calibData->[0]=$self->{calibration};
+	
+	$calibData->write($file);
+}
+
+=item $robot->calibrate($sensor)
+
+Calibrates indirect sensors.  Method will block until calibration is complete.  Robot will go though several complete rotations.
+Be sure to follow any instructions in calicration proceedure below.  Returns true on calibration success, false otherwise.
+$sensor can be one of the following:
+
+=over 5
+
+=item actualAngle:
+Calibrates actualAngle correction factors for dead reckoning
+
+=item cliffDev:
+Calibrates cliffSignalDev sensors
+
+=item all:
+Calibrates all sensors.
+
+=back
+
+Calibration procedure: For cliffDev, the robot needs only to be on the type of surface it will be used on most often.  For actualAngle, the
+procedure is more complicated.  A "Home Base" docking station and a way to block of part of the robots IR sensor is required.  Block all but a small
+section in the front of the IR Sensor.  I usually do this with a strip of aluminum foil.  Then place the robot a few feet away from the docking station and
+in a position so that the docking station can only be seen though the small gap you left in the IR sensor.
+
+Note:  You will need to call $robot->saveCalibrationData afterwards to save calibration to file.
+
+=cut
+
+sub calibrate($$) {
+	my $self=shift;
+	my $sensor=shift;
+	
+	my $wasStreaming=$self->{isStreaming};
+	my @calibration;
+	
+	my $seeDock=sub { ($self->getDockSignal())[0]; };
+	my $notSeeDock=sub { !(($self->getDockSignal())[0]); };
+	
+	if ($sensor eq 'actualAngle' || $sensor eq 'all') {
+		
+		if ($sensor eq 'all') {
+			$self->{gatherCliffStatistics}=1;
+			$self->{calibration}{cliffStatistics}={};
+		}
+		
+		my $rejectCount=0;
+		
+		my $testSpeed=100;
+	
+		while ($testSpeed<=500) {
+			my ($startAngle,$endAngle);
+	
+			$self->rotateLeft(200);
+			
+			$self->addSensorEvent(50,$seeDock,
+				sub {
+					$self->waitTime(50,1,sub {
+						$self->addSensorEvent(50,$notSeeDock,
+							sub {
+								$self->waitTime(50,1,sub {
+									$self->stop();
+									$self->waitTime(50,2,sub {
+										$self->rotateRight($testSpeed);
+										$self->addSensorEvent(50,$seeDock,
+											sub {
+												$startAngle=$self->{sensorState}{totalAngle};
+												
+												$self->addSensorEvent(50,$notSeeDock,
+													sub {
+														$self->addSensorEvent(50,$seeDock,
+															sub {
+																$endAngle=$self->{sensorState}{totalAngle};
+																$self->exitSensorLoop();
+															}
+														,0,1);
+													}
+												,0,1);
+											}
+										,0,1);
+									});	
+								});
+							}
+						,0,1);
+					});
+				}
+			,0,1);
+
+			$self->runSensorLoop();
+
+			my $testAngle=($startAngle-$endAngle)*($testSpeed<=>0);
+		
+			if ($testAngle<400 && $testAngle>200) {
+				push @calibration,(2*pi)/$testAngle;
+				
+				if ($testSpeed==100) {
+				for (my$i=0;$i<2;$i++) {
+					push @calibration,(2*pi)/$testAngle;
+				}
+			}
+				
+				$testSpeed+=50;
+			} else {
+				$rejectCount++;
+				return 0 if ($rejectCount>5);
+			}
+		}
+
+		$self->stop();
+		
+		sleep 2;
+		
+		$self->{calibration}{angleCorrection}=\@calibration;
+	}
+	
+	if ($sensor eq 'cliffDev') {
+		$self->{calibration}{cliffStatistics}={};
+		$self->{gatherCliffStatistics}=1;
+		
+		$self->waitAngle(50,4*pi,sub { $self->exitSensorLoop(); });
+		
+		$self->rotateLeft(200);
+		
+		$self->runSensorLoop();
+		
+		$self->stop();
+	}
+	
+	$self->{gatherCliffStatistics}=0;
+	
+	
+	$self->startStream(6) if ($wasStreaming);
+	
+	return 1;
+	
+}
+
+=item $robot->setMovementCorrectionMode($mode)
+
+Sets the movementCorrection method used by the module.  Can be one of the following:
+
+=over 5
+
+=item calibration:
+(default) Uses result of calibration to correct reported sensor values. See Sensor Calibration.
+=item time:
+Ignores angle sensor values and relies solely on requested movement and time.
+=item robot:
+Trusts value reported by robot angle sensor is accurate.  Assumes
+sensor value is difference between distance traveled by left wheel
+and distance travel by right wheel.  (This seems to actually be the case.)
+=item raw:
+Trusts value reported by robot angle sensor is accurate.  Assumes
+sensor value is degrees rotated.  (This is the value reported by the OI
+doc, but does not actually seem to be the case.)
+
+=back
+
+
+I<<Or>> you can pass your own sub to perform movement correction.  When called it will be passed $robot, $listener, and $sensorIds.
+$sensorIds is a array ref containing the read sensorIds. $listener is a hash containing the details of the sensor listener used to calculate
+indirect sensor values.  See addSensorListener for more details.  The sub must return a list containing actual distance traveled in mm
+followed by actual angle rotated in radians.
+
+=back
+
+=cut
+
+sub setMovementCorrectionMode($$) {
+	my $self=shift;
+	my $deadReckoner=shift;
+
+	if ($deadReckoner eq 'calibration') {
+		$deadReckoner=\&_correctiveDeadReckoning;
+	} elsif ($deadReckoner eq 'time') {
+		$deadReckoner=\&_timeDeadReckoning;
+	} elsif ($deadReckoner eq 'robot') {
+		$deadReckoner=\&_robotDeadReckoning;
+	} elsif ($deadReckoner eq 'raw') {
+		$deadReckoner=\&_rawDeadReckoning;
+	} 
+	
+	$self->{deadReckoning}=$deadReckoner;
+	
 }
 
 =head2 Closing Connection
@@ -2133,79 +2426,220 @@ as subsequent updates will be made to the same hash.
 
 These are sensor values that are read directly from the robot.
 
-	--Keys--
-	wheeldropCaster -- wheeldrop sensor on front caster (boolean)
-	wheeldropLeft -- wheeldrop sensor on left wheel (boolean)
-	wheeldropRight -- wheeldrop sensor on right wheel (boolean)
-	bumpLeft -- left bump sensor (boolean)
-	bumpRight -- right bump sensor (boolean)
-	wall -- physical wall sensor (boolean)
-	cliffLeft -- left cliff sensor (boolean)
-	cliffFrontLeft -- front-left cliff sensor (boolean)
-	cliffFrontRight -- front-right cliff sensor (boolean)
-	virtualWall -- virtual wall sensor (boolean)
-	ocLeftWheel -- overcurrent on left wheel (boolean)
-	ocRightWheel -- overcurrent on right wheel (boolean)
-	ocLD0 -- overcurrent on low side driver 0 (boolean)
-	ocLD1 -- overcurrent on low side driver 1 (boolean)
-	ocLD2 -- overcurrent on low side driver 2 (boolean)
-	irByte -- byte received by IR sensor (unsigned byte)
-	advanceButton -- advance button state (boolean)
-	playButton -- play button state (boolean)
-	distance -- distance travelled in mm since last sensor refresh (signed short)
-	angle -- angle turned in degrees since last sensor refresh (signed short)
-		positive angles are counter-clockwise
-		negative are clockwise
-		NOTE: This sensor is extremely inaccurate
-	chargingState -- indicates if robot is charging (boolean)
-	voltage -- voltage of battery (unsigned short)
-	current -- current of battery charge/discharged (signed short)
-		positive values indicate charging
-		negative indicate discharging
-	batteryTemp -- temperature of battery in degrees C (unsigned byte)
-	batteryCharge -- current battery charge in mAh (unsigned short)
-	batteryCapacity -- maximum battery capacity in mAh (unsigned short)
-	wallSignal -- raw signal value of wall sensor (unsigned short)
-	cliffLeftSignal -- raw signal value of left cliff sensor (unsigned short)
-	cliffFrontLeftSignal -- raw signal value of front-left sensor (unsigned short)
-	cliffFrontRightSignal -- raw signal value of front-right cliff sensor (unsigned short)
-	cliffRightSignal -- raw signal value of right cliff sensor (unsigned short)
-	deviceDetect -- state of robot's device detect pin (boolean)
-	digitalInput0 -- state of digital input 0 (boolean) 
-	digitalInput1 -- state of digital input 1 (boolean) 
-	digitalInput2 -- state of digital input 2 (boolean) 
-	digitalInput3 -- state of digital input 3 (boolean) 
-	analogIn -- value of analog input (unsigned short)
-	homeBaseAvailable -- true if robot is connected to home base (boolean)
-	internalCharger -- true if robot can charge battery using internal charger (boolean)
-	oiMode -- OI Interface mode (unsigned byte)
-	songNumber -- last selected song bank (unsigned byte)
-	songPlaying -- true if song is playing (boolean)
-	numPackets -- number of packets sent in last stream (byte)
-	requestedVelocity -- last requested velocity (signed short)
-	requestedRadius -- last requested turning radius (signed short)
-	requestedRightVelocity -- last requested right wheel velocity (signed short)
-	requestedLeftVelocity -- last requested left wheel velocity (signed short)
+=head3 Keys
+
+=over 5
+
+=item wheeldropCaster --
+wheeldrop sensor on front caster (boolean)
+
+=item wheeldropLeft --
+wheeldrop sensor on left wheel (boolean)
+
+=item wheeldropRight --
+wheeldrop sensor on right wheel (boolean)
+
+=item bumpLeft --
+left bump sensor (boolean)
+
+=item bumpRight --
+right bump sensor (boolean)
+
+=item wall --
+physical wall sensor (boolean)
+
+=item cliffLeft --
+left cliff sensor (boolean)
+
+=item cliffFrontLeft --
+front-left cliff sensor (boolean)
+
+=item cliffFrontRight --
+front-right cliff sensor (boolean)
+
+=item virtualWall --
+virtual wall sensor (boolean)
+
+=item ocLeftWheel --
+overcurrent on left wheel (boolean)
+
+=item ocRightWheel --
+overcurrent on right wheel (boolean)
+
+=item ocLD0 --
+overcurrent on low side driver 0 (boolean)
+
+=item ocLD1 --
+overcurrent on low side driver 1 (boolean)
+
+=item ocLD2 --
+overcurrent on low side driver 2 (boolean)
+
+=item irByte --
+byte received by IR sensor (unsigned byte)
+
+=item advanceButton --
+advance button state (boolean)
+
+=item playButton --
+play button state (boolean)
+
+=item distance --
+distance travelled in mm since last sensor refresh (signed short)
+
+=item angle --
+angle turned in degrees since last sensor refresh (signed short)
 	
-=head2 Indirect sensors
+	positive angles are counter-clockwise
+	negative are clockwise
+	NOTE: This sensor is extremely inaccurate (see actualAngle)
+
+=item chargingState --
+indicates if robot is charging (boolean)
+
+=item voltage --
+voltage of battery (unsigned short)
+
+=item current --
+current of battery charge/discharged (signed short)
+	
+	positive values indicate charging
+	negative indicate discharging
+
+=item batteryTemp --
+temperature of battery in degrees C (unsigned byte)
+
+=item batteryCharge --
+current battery charge in mAh (unsigned short)
+
+=item batteryCapacity --
+maximum battery capacity in mAh (unsigned short)
+
+=item wallSignal --
+raw signal value of wall sensor (unsigned short)
+
+=item cliffLeftSignal --
+raw signal value of left cliff sensor (unsigned short)
+
+=item cliffFrontLeftSignal --
+raw signal value of front-left sensor (unsigned short)
+
+=item cliffFrontRightSignal --
+raw signal value of front-right cliff sensor (unsigned short)
+
+=item cliffRightSignal --
+raw signal value of right cliff sensor (unsigned short)
+
+=item deviceDetect --
+state of robot's device detect pin (boolean)
+
+=item digitalInput0 --
+state of digital input 0 (boolean) 
+
+=item digitalInput1 --
+state of digital input 1 (boolean) 
+
+=item digitalInput2 --
+state of digital input 2 (boolean) 
+
+=item digitalInput3 --
+state of digital input 3 (boolean) 
+
+=item analogIn --
+value of analog input (unsigned short)
+
+=item homeBaseAvailable --
+true if robot is connected to home base (boolean)
+
+=item internalCharger --
+true if robot can charge battery using internal charger (boolean)
+
+=item oiMode --
+OI Interface mode (unsigned byte)
+
+=item songNumber --
+last selected song bank (unsigned byte)
+
+=item songPlaying --
+true if song is playing (boolean)
+
+=item numPackets --
+number of packets sent in last stream (byte)
+
+=item requestedVelocity --
+last requested velocity (signed short)
+
+=item requestedRadius --
+last requested turning radius (signed short)
+
+=item requestedRightVelocity --
+last requested right wheel velocity (signed short)
+
+=item requestedLeftVelocity --
+last requested left wheel velocity (signed short)
+
+=back
+
+=head2 Indirect Sensors
 
 These are sensor values that are derived from direct sensors.
-	
-	--Keys--
-	totalAngle -- sum of all previous angle readings
-	totalDistance -- sum of all previous distance readings
-	deltaX -- change in x coordinate since last reading
-	deltaY -- change in y coordinate since last reading
-	x -- x coordinate of current position
-	y -- y coordinate of current position
-	direction -- direction robot is currently facing in radians (between -PI and PI)
-	actualAngle -- an attempt to correct angle sensor, actual angle turned in radians
-	totalActualAngle -- sum of all previous actual angle readings
-	turningRadius -- estimated actual turning radius
-	cliffFrontSignalDelta, cliffFrontRightSignalDelta,
+
+=head3 Keys
+
+=over 5
+
+=item totalAngle --
+sum of all previous angle readings
+
+=item totalDistance --
+sum of all previous distance readings
+
+=item lastSensorReading --
+Timestamp in seconds of last reading
+
+=item deltaT --
+time in seconds since last reading
+
+=item deltaX --
+change in x coordinate since last reading
+
+=item deltaY --
+change in y coordinate since last reading
+
+=item x --
+x coordinate of current position
+
+=item y --
+y coordinate of current position
+
+=item direction --
+direction robot is currently facing in radians (between -PI and PI)
+
+=item actualAngle --
+an attempt to correct angle sensor; the actual angle turned in radians
+
+=item totalActualAngle --
+sum of all previous actual angle readings
+
+=item actualDistance --
+an attempt to correct distance sensor; the distance traveled in mm
+
+=item totalActualDistance --
+an attempt to correct distance sensor; the distance traveled in mm
+
+=item turningRadius --
+estimated actual turning radius
+
+=item cliffFrontSignalDelta, cliffFrontRightSignalDelta,
 	cliffLeftSignalDelta, cliffFrontLeftSignalDelta --
-		raw cliff signal readings using intial reading
-		as 0 baseline.
+change in cliff sensors since last reading
+
+=item cliffFrontSignalDev, cliffFrontRightSignalDev,
+	cliffLeftSignalDev, cliffFrontLeftSignalDev --
+difference from mean of current cliff sensor
+		value in standard deviations
+
+=back
 
 =head1 DEAD RECKONING
 
@@ -2213,16 +2647,16 @@ This module attempts to do some sensor correction and dead reckoning using senso
 
 =head2 Coordinate System
 
-When the $robot->init or $robot->markOrigin is called.  The x,y, and direction values of the robot
+When the $robot->new or $robot->markOrigin is called.  The x,y, and direction values of the robot
 are set to 0.  The robot is then assumed to be facing along the positive y-axis (direction 0).  The positive x-axis is
 90 clockwise.  Positive directions are counter-clockwise, negative directions are clockwise.
 
 =head2 Sensor Correction
 
 An attempt is made to correct inaccurate angle readings.  The correction is done using error factors determined
-experimentally on an Create.  Your mileage may vary.
+experimentally on a Create.  Your mileage may vary.
 
-A feature is planned to implement a calibration routine to determine error factors on an idividual robot.
+It is recommended that you calibrate your robot using the calibrate method before relying on dead reckoning.
 
 =cut
 
@@ -2272,91 +2706,218 @@ sub _updateSensorState($$$@) {
 	}
 }
 
-sub deadReckoning($$$) {
+sub _timeDeadReckoning($$$) {
 	my $self=shift;
 	my $listener=shift;
-	my $sensorId=shift;
+	my $sensorIds=shift;
+	
+	my $sensorState=$self->{sensorState};
+	
+	my $requestedVelocity=$sensorState->{requestedVelocity};
+	my $requestedRadius=$sensorState->{requestedRadius};
+	my $deltaT=$self->{isStreaming}?$EPSILON:$sensorState->{deltaT};
+	
+	my $turnDistance=$deltaT*$requestedVelocity;
+	my $actualAngle=($requestedRadius<=>0)*$turnDistance/(abs($requestedRadius)+$WHEEL_WIDTH/2);
+	my $distance=$sensorState->{distance};
+	
+	return ($distance,$actualAngle);
+}
+
+sub _correctiveDeadReckoning($$$) {
+	my $self=shift;
+	my $listener=shift;
+	my $sensorIds=shift;
+	
+	my $sensorState=$self->{sensorState};
+	
+	my $distance=$sensorState->{distance};
+	my $angle=$sensorState->{angle};
+
+	my $lastVelocity=$self->{lastVelocity};
+	my $angleCorrection=$self->{calibration}{angleCorrection}[int(abs($lastVelocity)/50)];
+
+	my $actualAngle=$angle*$angleCorrection;
+
+
+	return ($distance,$actualAngle);
+	
+}
+
+sub _robotDeadReckoning($$$) {
+	my $self=shift;
+	my $listener=shift;
+	my $sensorIds=shift;
+	
+	my $sensorState=$self->{sensorState};
+	
+	my $distance=$sensorState->{distance};
+	my $angle=$sensorState->{angle};
+	
+	my $actualAngle= 2* $angle/$WHEEL_WIDTH;
+	
+	return ($distance,$actualAngle);
+}
+
+sub _rawDeadReckoning($$$) {
+	my $self=shift;
+	my $listener=shift;
+	my $sensorIds=shift;
+	
+	my $sensorState=$self->{sensorState};
+	
+	my $distance=$sensorState->{distance};
+	my $angle=$sensorState->{angle};
+	
+	my $actualAngle=pi * $angle / 180;
+	
+	return ($distance,$actualAngle);
+}
+	
+
+sub _indirectSensors($$$) {
+	my $self=shift;
+	my $listener=shift;
+	my $sensorIds=shift;
 
 	my $sensorState=$self->{sensorState};
 	
+	my $now=time();
+	$sensorState->{deltaT}=$now-$self->{lastSensorRefresh};
+	$sensorState->{lastSensorRefresh}=$now;
+	
 	my $angle=$sensorState->{angle};
-	my $distance=$sensorState->{distance};
 	my $direction=$sensorState->{direction};
+	
+	my ($distance,$actualAngle)=&{$self->{deadReckoning}}($self,$listener,$sensorIds);
+	my ($dxf,$dyf)=_getRelativeMovement($actualAngle,$distance);
+	my ($dx,$dy)=_getAbsoluteMovement($direction,$dxf,$dyf);
+	
 		
 	$sensorState->{totalAngle}+=$angle;
 	$sensorState->{totalDistance}+=$distance;
-	
-	$self->logTelemetry(0,"TA".pack("s",$sensorState->{totalAngle}));
-        $self->logTelemetry(0,"TD".pack("s",$sensorState->{totalDistance}));
-	
-	my $lastVelocity=$self->{lastVelocity};
-	my $slipFactor=$slipFactors[int(abs($lastVelocity)/50)];
-	
-	$self->logTelemetry(64,"LV".pack("s",$lastVelocity));
-        $self->logTelemetry(64,"SF".pack("d",$slipFactor));
-	
-	my $actualAngle=$angle*$slipFactor;
-	
-	my ($turningRadius,$dxf,$dyf);
-	if ($actualAngle==0) {
-		$turningRadius=undef;
-		$dxf=0;
-		$dyf=$distance;
-	} else {
-		$turningRadius=$distance/$actualAngle;
-		$dxf=$turningRadius*(1-cos($actualAngle));
-		$dyf=$turningRadius*sin($actualAngle);
-	}
-	
-	my $dx=$dyf*sin(-$direction)+$dxf*cos(-$direction);
-	my $dy=$dyf*cos(-$direction)-$dxf*sin(-$direction);
+		
 	$sensorState->{deltaX}=$dx;
 	$sensorState->{deltaY}=$dy;
 	$sensorState->{x}+=$dx;
 	$sensorState->{y}+=$dy;
-	
-	$self->logTelemetry(0,"DX".pack("d",$dx));
-        $self->logTelemetry(0,"DY".pack("d",$dy));
-        $self->logTelemetry(0,"XX".pack("d",$sensorState->{x}));
-        $self->logTelemetry(0,"YY".pack("d",$sensorState->{y}));
-	
+			
 	$direction=_normalizeAngle($direction+$actualAngle);
 	$sensorState->{direction}=$direction;
+	$sensorState->{actualDistance}=$distance;
 	$sensorState->{actualAngle}=$actualAngle;
 	$sensorState->{totalActualAngle}+=$actualAngle;
+	$sensorState->{totalActualDistance}+=$distance;
+	my $turningRadius=$actualAngle!=0?$distance/$actualAngle:undef;
 	$sensorState->{turningRadius}=$turningRadius;
+			
+	$self->_updateCliffStatistics() if ($self->{gatherCliffStatistics});
 	
+	my $lastCliff=$self->{lastCliff};
 	
-	$self->logTelemetry(0,"DR".pack("d",$direction));
-        $self->logTelemetry(0,"AA".pack("d",$actualAngle));
-        $self->logTelemetry(0,"TC".pack("d",$sensorState->{totalActualAngle}));
-        $self->logTelemetry(0,"TR".pack("d",$turningRadius));
-	
-	if (@{$self->{initialCliff}}==0) {
-		$self->{initialCliff}=[$sensorState->{cliffRightSignal},$sensorState->{cliffFrontRightSignal},$sensorState->{cliffFrontLeftSignal},$sensorState->{cliffLeftSignal}];
+	foreach my $sensor (@cliffSensors) {
+		my $signal=$sensorState->{$sensor . 'Signal'};
+		$sensorState->{$sensor . 'SignalDev'}=$self->_getCliffDeviation($sensor,$signal);
+		$sensorState->{$sensor . 'SignalDelta'}=defined($lastCliff->{$sensor})?$signal-$lastCliff->{$sensor}:0;
+		$lastCliff->{$sensor}=$signal;
 	}
-	
-	$sensorState->{cliffRightSignalDelta}-=$self->{initialCliff}[0];
-	$sensorState->{cliffFrontRightSignalDelta}-=$self->{initialCliff}[1];
-	$sensorState->{cliffFrontLeftSignalDelta}-=$self->{initialCliff}[2];
-	$sensorState->{cliffLeftSignalDelta}-=$self->{initialCliff}[3];
 		
 	return 1;
 }
 
+sub _getRelativeMovement($$) {
+	my ($actualAngle,$distance)=@_;
+	
+	if ($actualAngle==0) {
+		return (0,$distance);
+	} else {
+		my $turningRadius=$distance/$actualAngle;
+		my $dxf=$turningRadius*(1-cos($actualAngle));
+		my $dyf=$turningRadius*sin($actualAngle);
+		
+		return ($dxf,$dyf);
+	}
+}
+
+sub _getAbsoluteMovement($$$) {
+	my ($direction,$dxf,$dyf)=@_;
+	
+	return ($dyf*sin(-$direction)+$dxf*cos(-$direction),
+		   $dyf*cos(-$direction)-$dxf*sin(-$direction));
+
+}
+
+sub _updateCliffStatistics($) {
+	my $self=shift;
+	my $sensorState=$self->{sensorState};
+	my $cliffStatistics=$self->{calibration}{cliffStatistics};
+	
+	if (!defined($cliffStatistics->{$cliffSensors[0]})) {
+		$cliffStatistics={};
+		$self->{calibration}{cliffStatistics}=$cliffStatistics;
+		
+		for my $sensor (@cliffSensors) {
+			$cliffStatistics->{$sensor}=[0,0,0];
+		}
+	}
+	
+	for my $sensor (@cliffSensors) {
+		my $sensorStats=$cliffStatistics->{$sensor};
+		my $signal=$sensorState->{$sensor.'Signal'};
+		
+		$sensorStats->[0]++;
+		$sensorStats->[1]+=$signal;
+		$sensorStats->[2]+=($signal*$signal);
+	}
+	
+	#print Dump($self->{calibration});
+}
+
+sub _getCliffDeviation($$) {
+	my $self=shift;
+	my $sensor=shift;
+	my $signal=shift;
+	
+	my $sensorStats=$self->{calibration}{cliffStatistics}{$sensor};
+	
+	my $mean=$sensorStats->[0]?$sensorStats->[1]/$sensorStats->[0]:0;
+	my $stddev=$sensorStats->[0]?sqrt($sensorStats->[2]/$sensorStats->[0]-$mean*$mean):1;
+	
+	return $stddev==0?0:($signal-$mean)/$stddev;
+}
+	
+
 ##########Serial Port Comm##############
 
-sub _initPort($) {
+=head1 RAW COMMUNICATION
+
+The below methods can be used to for raw communication with the robot.  Use of these withing the same application as
+the rest of the methods in this module is strongly discouraged.
+
+=over 4
+
+=item $robot->initPort()
+
+Initializes the communications port.  Returns true on success, false otherwise.
+
+=cut
+
+sub initPort($) {
 	my $self=shift;
 	
 	my $port;
-		
-		while(!$port) {
-			print "Connecting...\n";
-			$port=Device::SerialPort->new($self->{portFile});
-			sleep 1 unless ($port);
+	
+	my $retries=5;
+
+	while(!$port && $retries>0) {
+		$port=Device::SerialPort->new($self->{portFile});
+		unless ($port) {
+			sleep 1;
+			$retries--;
 		}
-		
+	}
+	
+	if ($retries>0) {
 		$port->databits(8);
 		$port->baudrate(57600);
 		$port->parity("none");
@@ -2365,7 +2926,18 @@ sub _initPort($) {
 		$port->read_const_time(15);
 
 		$self->{port}=$port;
+		
+		return 1;
+	} else {
+		return 0;
+	}
 }
+
+=item $robot->writeBytes(@bytes)
+
+Writes bytes in @bytes to robot.
+
+=cut
 
 sub writeBytes(@) {
 	my $self=shift;
@@ -2377,7 +2949,7 @@ sub writeBytes(@) {
 		
 		my $data=pack('C*',@_);
 		
-		$self->writeTelem('W',$data);
+		$self->_writeTelem('W',$data);
 
                 $self->{port}->write($data) unless ($self->{replay});
         }
@@ -2407,8 +2979,6 @@ sub _handleReplayMessage($$$$) {
 	my $data=shift;
 	
 }
-	
-	
 
 sub _readReplayData($) {
         my $self=shift;
@@ -2418,7 +2988,7 @@ sub _readReplayData($) {
         my ($time,$type,$data);
         
         while($type ne 'R') {
-                ($time,$type,$data)=$self->readTelem();
+                ($time,$type,$data)=$self->_readTelem();
                 die "End of Telemetry Data" if ($type eq 'E');
 		if ($type eq 'W') {
 			$self->_handleReplayWrite($time,$data);
@@ -2436,6 +3006,18 @@ sub _readReplayData($) {
         return (length($data),$data);
 }
 
+=item $robot->readData($length)
+
+Reads $length bytes from robot.  Blocks until bytes are read.  Returns bytes read as string.  
+
+Data returned by this method will probably need to be passed to unpack.  For example, to get an array of 4 bytes from robot use:
+
+	unpack('C*',$robot->readData(4))
+
+=back
+
+=cut
+
 sub readData($$) {
 	my $self=shift;
 	my $length=shift;
@@ -2451,7 +3033,7 @@ sub readData($$) {
 
 	while($length>0) {
 		my ($got,$saw)=$self->{replay}?$self->_readReplayData():$self->{port}->read($length);
-		$self->writeTelem('R',$saw);
+		$self->_writeTelem('R',$saw);
 
 		if ($got>=$length) {
 			$data.=substr($saw,0,$length,'');
@@ -2493,21 +3075,15 @@ $sensorGroups=[[7,26],[7,16],[17,20],[21,26],[27,34],[35,42],[7,42]];
 'cliffFrontRightSignal','cliffRightSignal','','analogIn','','oiMode','songNumber','songPlaying','numPackets','requestedVelocity',
 'requestedRadius','requestedRightVelocity','requestedLeftVelocity');
 
-@slipFactors=(0.0240735069240597, 0.0240735069240597, 0.0240735069240597, 0.0160695276398455,
-0.0212269773891202, 0.0162776821429523, 0.0165346981767884, 0.0185893056425432,
-0.0181071622685291, 0.0178499582590329, 0.0179008128409675);
-
-@keys=('advanceButton', 'analogIn', 'actualAngle', 'batteryCapacity', 'batteryCharge',
-'batteryTemp', 'bumpLeft', 'bumpRight', 'chargingState', 'cliffFrontLeft',
-'cliffFrontLeftSignal', 'cliffFrontRight', 'cliffFrontRightSignal', 'cliffLeft', 'cliffLeftSignal',
-'cliffRight', 'cliffRightSignal', 'current', 'deltaX', 'deltaY', 'deviceDetect', 'digitalInput0',
-'digitalInput1', 'digitalInput2', 'digitalInput3', 'direction', 'distance',
-'homeBaseAvailable', 'internalCharger', 'irByte', 'lastAvgDirection', 'numPackets',
-'ocLD0', 'ocLD1', 'ocLD2', 'ocLeftWheel', 'ocRightWheel', 'oiMode', 'playButton',
-'requestedLeftVelocity', 'requestedRadius', 'requestedRightVelocity',
-'requestedVelocity', 'songNumber', 'songPlaying', 'totalAngle', 'totalDistance',
-'virtualWall', 'voltage', 'wall', 'wallSignal', 'wheeldropCaster', 'wheeldropLeft',
-'wheeldropRight', 'x', 'y');
+$calibrationDefaults={angleCorrection=>[0.0240735069240597, 0.0240735069240597, 0.0240735069240597,
+	0.0160695276398455, 0.0212269773891202, 0.0162776821429523,
+	0.0165346981767884, 0.0185893056425432, 0.0181071622685291,
+	0.0178499582590329, 0.0179008128409675],
+	cliffStatistics=>{cliffRight=>[5811,4813494,4025842820],
+		cliffFrontRight=>[5811,3588708,2232898560],
+		cliffFrontLeft=>[5811,2352886,960201844],
+		cliffLeft=>[5811,3137619,1706701033]}
+};
 
 $notes={
 	'c'=>0,
@@ -2530,6 +3106,22 @@ $keys={'Cb'=>-7,
 'B'=>5,'F#'=>6,'C#'=>7};
 
 @sharps=('f','c','g','d','a','e','b');
+
+$sensorLocations={cliffLeft=>[$ROBOT_WIDTH/2-10,deg2rad(150)],
+	cliffFrontLeft=>[$ROBOT_WIDTH/2-10,deg2rad(105)],
+	cliffFrontRight=>[$ROBOT_WIDTH/2-10,deg2rad(75)],
+	cliffRight=>[$ROBOT_WIDTH/2-10,deg2rad(30)],
+	bumpLeft=>[$ROBOT_WIDTH/2-10,deg2rad(135)],
+	bumpCenter=>[$ROBOT_WIDTH/2-10,deg2rad(90)],
+	bumpRight=>[$ROBOT_WIDTH/2-10,deg2rad(45)],
+	caster=>[$ROBOT_WIDTH/2-10,deg2rad(90)],
+	irSensor=>[$ROBOT_WIDTH/2-10,deg2rad(90)],
+	wheelLeft=>[$ROBOT_WIDTH/2-10,deg2rad(180)],
+	wheelRight=>[$WHEEL_WIDTH/2,0]
+};
+
+@cliffSensors=('cliffLeft','cliffFrontLeft','cliffFrontRight','cliffRight');
+
 
 =head1 AUTHOR
 

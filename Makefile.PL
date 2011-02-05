@@ -15,6 +15,7 @@ WriteMakefile(
         'Test::More' => 0,
 	'Time::HiRes' => 0,
 	'Device::SerialPort' => 0,
+	'YAML::Tiny' => 0,
 	'POSIX' => 0,
 	'Math::Trig' => 0
     },
