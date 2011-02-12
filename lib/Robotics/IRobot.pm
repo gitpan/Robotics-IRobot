@@ -39,11 +39,11 @@ Robotics::IRobot - provides interface to iRobot Roomba and Create robots
 
 =head1 VERSION
 
-Version 0.12
+Version 0.13
 
 =cut
 
-our $VERSION='0.12';
+our $VERSION='0.13';
 
 =head1 REFERENCES
 
@@ -82,9 +82,7 @@ use this module.
 
 =head1 DEVELOPMENT STATUS
 
-This software is currently in alpha status.  Dead reckoning and telemetry are still a work in progress.  So, expect
-sensor values produced by dead reckoning and motions produced by $robot->goTo and $robot->turnTo to be
-inaccurate at best.
+This software is currently in alpha status.  Telemetry is still a work in progress.  
 
 =cut
 
@@ -149,6 +147,9 @@ sub new {
 =item $robot->init()
 
 Initializes the port, connects to the robot, and initiates the OI Interface.
+
+I<You must call one of startSafeMode or startFullMode before calling
+actuator commands.>
 
 =cut
 
@@ -218,8 +219,6 @@ sub reset($) {
 	$self->close();
 	sleep 5;
 	
-	$self->initPort();
-	sleep 1;
 	return $self->init();
 }
 
@@ -248,6 +247,8 @@ sub startSafeMode {
 	my $self=shift;
 	
 	$self->writeBytes(131);
+	
+	sleep .03;
 }
 
 =item $robot->startFullMode()
@@ -263,6 +264,8 @@ sub startFullMode {
 	my $self=shift;
 	
 	$self->writeBytes(132);
+	
+	sleep .03;
 }
 
 =item $robot->startDemo($demoId)
@@ -279,7 +282,7 @@ sub startDemo($$) {
 	$self->writeBytes(136,$demo);
 }
 
-=item $robot->stopDemo($demoId)
+=item $robot->stopDemo()
 
 Stops currently running demo.
 
@@ -370,7 +373,7 @@ sub reverse($$) {
 
 =item $robot->rotateRight($velocity)
 
-Rotates robot in place right (counter-clockwise) at $velocity (in mm/s).
+Rotates robot in place right (clockwise) at $velocity (in mm/s).
 
 =cut
 
@@ -383,7 +386,7 @@ sub rotateRight($$) {
 
 =item $robot->rotateLeft($velocity)
 
-Rotates robot in place left (clockwise) at $velocity (in mm/s).
+Rotates robot in place left (counter-clockwise) at $velocity (in mm/s).
 
 =cut
 
@@ -1159,7 +1162,7 @@ sub getDockSignal($) {
 
 =item $robot->getSensorLocation($sensor)
 
-Gets the current location of a sensor on the create.  Possible sensors:
+Gets the current location of a sensor relative to the origin.  Possible sensors:
 
 =over 4
 
@@ -1318,7 +1321,7 @@ sub exitSensorLoop($) {
 
 =item $robot->startStream($sensorId)
 
-Puts robot into streaming mode.  If a $sensorId is passed only streams that sensor.  Otherwises streams data from
+Puts robot into streaming mode.  If a $sensorId is passed only streams that sensor (not recommended).  Otherwises streams data from
 all sensors.
 
 See OI Documentation for more details
@@ -1364,7 +1367,7 @@ sub resumeStream($) {
 
 =item $robot->getStreamFrame()
 
-Gets one frame of sensor data, updates sensor data hash, and triggers any sensor listerners or events.
+Gets one frame of sensor data, updates sensor data hash, and triggers any sensor listeners or events.
 Should be called at least once every 15ms.  Method will block
 until one frame of sensor data has been read.
 
@@ -1564,13 +1567,16 @@ I<NOTE: if this method is called while in scripting mode, $priority and $callbac
 
 sub waitDistance($$$) {
 	my $self=shift;
-	my $priority=shift;
-	my $distance=shift;
-	my $callback=shift;
 	
 	if ($self->{scriptMode}) {
+		my $distance=shift;
+		
 		$self->scriptWaitDistance($distance);
 	} else {
+		my $priority=shift;
+		my $distance=shift;
+		my $callback=shift;
+		
 		my $listener=sub ($$$) {
 			my ($self,$listener,$sensorId)=@_;
 			
@@ -1600,13 +1606,16 @@ I<NOTE: if this method is called while in scripting mode,  $priority and $callba
 
 sub waitAngle($$$$) {
 	my $self=shift;
-	my $priority=shift;
-	my $angle=shift;
-	my $callback=shift;
 	
 	if ($self->{scriptMode}) {
+		my $angle=shift;
+		
 		$self->scriptWaitAngle($angle);
 	} else {
+		my $priority=shift;
+		my $angle=shift;
+		my $callback=shift;
+		
 		my $listener=sub ($$$) {
 			my ($self,$listener,$sensorId)=@_;
 			
@@ -1663,13 +1672,16 @@ I<NOTE: if this method is called while in scripting mode,  $priority and $callba
 
 sub waitTime($$$) {
 	my $self=shift;
-	my $priority=shift;
-	my $time=shift;
-	my $callback=shift;
 	
 	if ($self->{scriptMode}) {
+		my $time=shift;
+
 		$self->scriptWaitTime($time);
 	} else {
+		my $priority=shift;
+		my $time=shift;
+		my $callback=shift;
+		
 		return $self->addSensorEvent($priority,sub {return (time()>$_[1]->{param});},$callback,time()+$time,1);
 	}
 }
@@ -1803,6 +1815,7 @@ sub getSensorString($) {
 }
 
 =item $robot->getCondensedString()
+
 =item $robot->getCondensedString($lineEnding)
 
 Returns a string condensed version of the current state of the robots sensors.  Suitable for output in a command line
@@ -2037,6 +2050,7 @@ sub scriptWaitAngle($$) {
 	$self->writeBytes(157,_convertFSS($angle));
 }
 
+=item $robot->waitEvent($eventId)
 =item $robot->scriptWaitEvent($eventId)
 
 Waits until event with id $eventId occurs.  Robot will not respond to commands during this time.
@@ -2048,6 +2062,7 @@ See OI Documentation for list of event ids.
 
 =cut
 
+sub waitEvent($$) { scriptWaitEvent(@_); }
 sub scriptWaitEvent($$) {
 	my $self=shift;
 	my $event=shift;
@@ -2169,6 +2184,30 @@ sub _writeTelem($$$) {
 
 =head2 Sensor Calibration
 
+Sensor calibration can be used to correct for some inconsistancies and inaccuracies of the robot.  2 sets of sensors can be calibrated.
+
+The first is the angle sensor.  This sensor is supposed to return the angle turned in degrees since the last sensor reading.  In practice it
+is extremely inaccurate.  The accuracy can be some what improved by calculating the ratio between actual angle turned and angle reported
+at different velocities and then applying this ratio to read sensor values.  This corrected value can be seen in the actualAngle and totalActualAngle
+indirect sensors.
+
+The second set are the cliff signal sensors.  These sensors report the IR reflectivity of 4 sections of floor near the front of the robot.
+These values could be used for example, to follow a dark line drawn on the ground.
+The sensors tend to be accurate individually, but each sensor will have a slightly different bias-- meaning each sensor will read the same
+section of floor differently.  To correct for this we can generate statistics describing the range of values seen by each sensor
+over the same section of floor.  We can then use this to determine the distance from the mean in standard deviations for
+a value read by a particular sensor based on the previous values read for that sensor.  This value should be the same for each sensor
+when reading the same section of floor.  These values are seen in the cliff...SignalDev indirect sensors.
+
+Once these calibration data are created.  They can be saved and retrieved using the saveCalibrationData and loadCalibrationData methods.
+
+Note: default calibration values are provided, these were generated from calibration of my robot on my carpet.  However, it is strongly
+recommended to calibrate your own robot and create a calibration file for each type of flooring on which you plan to operate the robot.  The
+type of flooring will change both the wheel slipage and IR reflectivity, so both the angle and cliff signal sensors will need to be recalibrated.
+
+
+See section Indirect sensors for more information.
+
 =over 4
 
 =item $robot->loadCalibrationData($file)
@@ -2189,7 +2228,7 @@ sub loadCalibrationData($$) {
 
 =item $robot->saveCalibrationData($file)
 
-Saves calibration data to $file or calibration.yaml if no file is given.
+Saves calibration data to $file or calibration.yaml if no file is given.  
 
 =cut
 
@@ -2347,20 +2386,22 @@ Sets the movementCorrection method used by the module.  Can be one of the follow
 =over 5
 
 =item calibration:
-(default) Uses result of calibration to correct reported sensor values. See Sensor Calibration.
+(default) Uses result of calibration to correct reported sensor values. This works best when robot is limited to straight movement and rotation in place.  See Sensor Calibration.
+
 =item time:
 Ignores angle sensor values and relies solely on requested movement and time.
+
 =item robot:
 Trusts value reported by robot angle sensor is accurate.  Assumes
 sensor value is difference between distance traveled by left wheel
 and distance travel by right wheel.  (This seems to actually be the case.)
+
 =item raw:
 Trusts value reported by robot angle sensor is accurate.  Assumes
 sensor value is degrees rotated.  (This is the value reported by the OI
 doc, but does not actually seem to be the case.)
 
 =back
-
 
 I<<Or>> you can pass your own sub to perform movement correction.  When called it will be passed $robot, $listener, and $sensorIds.
 $sensorIds is a array ref containing the read sensorIds. $listener is a hash containing the details of the sensor listener used to calculate
@@ -2420,7 +2461,8 @@ sub close($) {
 =head1 SENSORS
 
 The sensor state hash can be retrieved from the $robot->getSensorState() method.  This only need be retrieved once
-as subsequent updates will be made to the same hash.
+as subsequent updates will be made to the same hash.  Each direct and indirect sensor reading can be retrieved from this
+hash using the keys below.
 
 =head2 Direct Sensors
 
@@ -2891,7 +2933,7 @@ sub _getCliffDeviation($$) {
 
 =head1 RAW COMMUNICATION
 
-The below methods can be used to for raw communication with the robot.  Use of these withing the same application as
+The below methods can be used to for raw communication with the robot.  Use of these within the same application as
 the rest of the methods in this module is strongly discouraged.
 
 =over 4
@@ -3121,6 +3163,131 @@ $sensorLocations={cliffLeft=>[$ROBOT_WIDTH/2-10,deg2rad(150)],
 };
 
 @cliffSensors=('cliffLeft','cliffFrontLeft','cliffFrontRight','cliffRight');
+
+
+=head1 EXAMPLES
+
+=head2 Wall bouncing
+
+Moves robot foward until a bump sensor is triggered, then backs up and
+turns a random angle before continuing forward.  Runs unil user hits the 'c' (close) or 's' (stop) keys.
+
+	#!/usr/bin/perl
+	
+	use Robotics::IRobot;
+	use Term::ReadKey;
+	use Math::Trig; #for deg2rad
+	
+	print "Connecting...\n";
+	my $iRobot=Robotics::IRobot->new('/dev/rfcomm0');
+	
+	#init robot and turn on hardware safeties
+	$iRobot->init();
+	print "Connected\n";
+	$iRobot->startSafeMode();
+	
+	ReadMode 4,STDIN;
+	
+	my $sensorState=$iRobot->{sensorState};
+	
+	#check for a key press and display sensor output with every sensor read
+	$iRobot->addSensorListener(300,sub {
+			my $c=ReadKey -1, STDIN;
+	
+			if ($c) {
+				if ($c eq  's') {
+					#stop robot on s
+					$iRobot->stop();
+				} elsif ($c eq 'c') {
+					#stop loop and exit program on c
+					$iRobot->exitSensorLoop();
+				}
+			}
+			
+			#display sensor output
+			print $iRobot->getCondensedString("\n") . "\n";
+			
+		},0);
+	
+	#action=0 moving foward
+	#action=1 turning left
+	#action=2 turning right
+	#used to track whether we are responding to a bump event
+	my $action=0;
+	
+	#trigger event when we are not responding to a bump event and one of
+	#the bump sensors activates.
+	$iRobot->addSensorEvent(200,sub {!$action && ($sensorState->{bumpRight} || $sensorState->{bumpLeft})},
+		sub {
+			#figure out which way to turn
+			$action=$sensorState->{bumpRight}?1:2;
+			
+			#back up
+			$iRobot->reverse(200);
+			
+			#after .5s
+			$iRobot->waitTime(200,.5,sub {
+			
+				#rotate away from bump
+				if ($action==1) {
+					$iRobot->rotateLeft(200);
+				} else {
+					$iRobot->rotateRight(200);
+				}
+				
+				#wait for random angle
+				$iRobot->waitAngle(200,deg2rad(10 + 120*rand()),
+					sub {
+						
+						#then continue forward
+						$iRobot->forward(300);
+						$action=0;
+					}
+				);
+			});
+		},0,0);
+	
+	#begin moving forward
+	$iRobot->forward(300);
+	
+	#start sensor loop and event processing
+	$iRobot->runSensorLoop();
+	
+	#close connection
+	$iRobot->close();
+	
+	ReadMode 0, STDIN;
+
+=head2 Scripting
+
+Uses robot's on board scripting to continuously move 500mm back and forth.  Robot will continue to do this until power button is pressed.
+
+See OI Documentation for more details.
+
+	#!/usr/bin/perl
+
+	use Robotics::IRobot;
+
+	my $robot=Robotics::IRobot->new();
+
+	$robot->init();
+	$robot->startSafeMode();
+
+	$robot->startScript();
+
+		$robot->forward(300);
+		$robot->waitDistance(500);
+		$robot->rotateLeft(200);
+		$robot->waitAngle(180);
+		$robot->forward(300);
+		$robot->waitDistance(500);
+		$robot->rotateLeft(200);
+		$robot->waitAngle(180);
+		$robot->repeatScript();
+
+	$robot->endScript();
+
+	$robot->runScript();
 
 
 =head1 AUTHOR
