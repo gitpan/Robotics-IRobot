@@ -39,11 +39,11 @@ Robotics::IRobot - provides interface to iRobot Roomba and Create robots
 
 =head1 VERSION
 
-Version 0.13
+Version 0.14
 
 =cut
 
-our $VERSION='0.13';
+our $VERSION='0.14';
 
 =head1 REFERENCES
 
@@ -156,7 +156,7 @@ actuator commands.>
 sub init {
 	my $self=shift;
 	
-	$self->initPort();
+	$self->initPort()  || die "Unable to initialize port";
 	sleep 1;
 	
 	$self->writeBytes(128);
@@ -1429,7 +1429,7 @@ The priority parameter is used to determine the order in which listeners are cal
 Any listeners with a negative priority will be called before indirect sensors (dead reckoning) is calculated.  Listeners with
 a priority less than 200 will be called before triggers for waitDistance, waitAngle, etc. events are called.
 
-On each sensor data retrieval &$action($robot,$listener,$sensorIds) will be called.  $sensorIds is a array ref containing the read sensorIds. 
+On each sensor data retrieval &$action($robot,$listener,$sensorIds) will be called.  $sensorIds is a array ref containing the read sfensorIds. 
 $listener is a hash containing the following keys:
 
 =over 5
@@ -1448,9 +1448,10 @@ the value of $param passed to addSensorListener
 
 =back
 
-The same hash ref is returned with each call, so this can be used by the action callback to store values.  $action must return
-true for processing of additional listeners to continue.  This is useful for saftey checks, if you do not want any additional processing
-which could restart a stopped robot have $action return false.
+The same hash ref is returned with each call, so this can be used by the action callback to store values.
+
+Additionally, setting $listener->{stop} to true will prevent listeners with a higher priority value from executing.  This is useful for listeners
+which implement safeties.
 
 $robot->addSensorListener returns the listener id.  This can be used to remove the listener later.
 
@@ -1508,8 +1509,7 @@ is a hash reference (see addSensorListener).  $sensorIds is the array ref contai
 is called if $test returns true. $param is included in the $listener hash ref.  If $oneTime is true, the created listener is
 automatically removed the first time $test returns true.
 
-As with addSensorListener, $action must return true if you wish additional listeners to continue processing.  Returning
-false will stop further listeners and events from processing.
+As with addSensorListener, setting $listener->{stop} to true will stop further listeners and events from processing.
 
 This method returns an id which can be passed to removeSensorListener to remove the event.
 
@@ -1723,7 +1723,9 @@ sub _triggerSensorEvents($$) {
 
 	my $sensorListener;
 	foreach $sensorListener (@{$self->{sensorListeners}}) {
-		last unless (&{$sensorListener->{action}}($self,$sensorListener,$sensorIds));
+		$sensorListener->{stop}=0;
+		&{$sensorListener->{action}}($self,$sensorListener,$sensorIds);
+		last if ($sensorListener->{stop});
 	}
 	
 }
